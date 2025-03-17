@@ -1,0 +1,1096 @@
+type Product {
+    product_id: Int!
+    name: String!
+    price: Float!
+    category: Category!
+}
+
+type Category {
+    category_id: Int!
+    name: String!
+}
+
+type Order {
+    order_id: Int!
+    customer_id: Int!
+    order_date: String!
+    total_amount: Float!
+}
+
+type Customer {
+    customer_id: Int!
+    email: String!
+    first_name: String!
+    last_name: String!
+    lifetime_value: Float!  # Added derived attribute
+}
+
+type SalesTrend {
+    date: String!
+    total_sales: Float!
+}
+
+type ProductSalesSummary {
+    product_id: Int!
+    product_name: String!
+    category_name: String!
+    total_units_sold: Int!
+    total_revenue: Float!
+    order_count: Int!
+}
+
+type Query {
+    productSales(
+        startDate: String!
+        endDate: String!
+        productId: Int
+        categoryId: Int
+        limit: Int = 10
+        offset: Int = 0
+        sortBy: String = "order_date"
+        sortOrder: String = "ASC"
+    ): [Order!]!
+
+    customerPurchaseHistory(
+        customerId: Int!
+        startDate: String
+        endDate: String
+        limit: Int = 10
+        offset: Int = 0
+        sortBy: String = "order_date"
+        sortOrder: String = "DESC"
+    ): [Order!]!
+
+    topSellingProductsByCategory(
+        categoryId: Int!
+        startDate: String
+        endDate: String
+        limit: Int = 10
+        sortBy: String = "total_units_sold"
+        sortOrder: String = "DESC"
+    ): [ProductSalesSummary!]!
+
+    salesTrends(
+        startDate: String!
+        endDate: String!
+        interval: String = "day"  # day, week, month
+    ): [SalesTrend!]!
+}
+
+type Mutation {
+    updateProduct(
+        productId: Int!
+        name: String
+        price: Float
+    ): Product!
+}from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from ariadne import QueryType, MutationType, gql, make_executable_schema
+from ariadne.asgi import GraphQL
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# Database connection
+def get_db_connection():
+    return psycopg2.connect(
+        dbname="ecommerce", user="admin", password="password", host="postgres", port="5432",
+        cursor_factory=RealDictCursor
+    )
+
+
+# Load GraphQL schema
+with open("schema.graphql", "r") as f:
+    type_defs = gql(f.read())
+
+# Define query and mutation resolvers
+query = QueryType()
+mutation = MutationType()
+
+
+@query.field("productSales")
+def resolve_product_sales(_, info, startDate, endDate, productId=None, categoryId=None,
+                          limit=10, offset=0, sortBy="order_date", sortOrder="ASC"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT o.order_id, o.customer_id, o.order_date, o.total_amount
+        FROM orders o
+        JOIN order_items oi ON o.order_id = oi.order_id
+        JOIN products p ON oi.product_id = p.product_id
+        WHERE o.order_date BETWEEN %s AND %s
+        AND o.status NOT IN ('Cancelled', 'Returned')
+        {product_filter}
+        {category_filter}
+        ORDER BY {sort_by} {sort_order}
+        LIMIT %s OFFSET %s
+    """
+    filters = []
+    params = [startDate, endDate]
+    if productId:
+        filters.append("oi.product_id = %s")
+        params.append(productId)
+    if categoryId:
+        filters.append("p.category_id = %s")
+        params.append(categoryId)
+
+    query = query.format(
+        product_filter="AND " + " AND ".join(filters) if filters else "",
+        category_filter="",
+        sort_by=f"o.{sortBy}" if sortBy in ["order_date", "total_amount"] else "o.order_date",
+        sort_order=sortOrder if sortOrder in ["ASC", "DESC"] else "ASC"
+    )
+    cursor.execute(query, params + [limit, offset])
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"order_id": r["order_id"], "customer_id": r["customer_id"],
+             "order_date": r["order_date"].isoformat(), "total_amount": float(r["total_amount"])}
+            for r in results]
+
+
+@query.field("customerPurchaseHistory")
+def resolve_customer_purchase_history(_, info, customerId, startDate=None, endDate=None,
+                                      limit=10, offset=0, sortBy="order_date", sortOrder="DESC"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT order_id, customer_id, order_date, total_amount
+        FROM orders
+        WHERE customer_id = %s
+        AND status NOT IN ('Cancelled', 'Returned')
+        {date_filter}
+        ORDER BY {sort_by} {sort_order}
+        LIMIT %s OFFSET %s
+    """
+    params = [customerId]
+    filters = []
+    if startDate:
+        filters.append("order_date >= %s")
+        params.append(startDate)
+    if endDate:
+        filters.append("order_date <= %s")
+        params.append(endDate)
+
+    query = query.format(
+        date_filter="AND " + " AND ".join(filters) if filters else "",
+        sort_by=f"{sortBy}" if sortBy in ["order_date", "total_amount"] else "order_date",
+        sort_order=sortOrder if sortOrder in ["ASC", "DESC"] else "DESC"
+    )
+    cursor.execute(query, params + [limit, offset])
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"order_id": r["order_id"], "customer_id": r["customer_id"],
+             "order_date": r["order_date"].isoformat(), "total_amount": float(r["total_amount"])}
+            for r in results]
+
+
+@query.field("topSellingProductsByCategory")
+def resolve_top_selling_products(_, info, categoryId, startDate=None, endDate=None,
+                                 limit=10, sortBy="total_units_sold", sortOrder="DESC"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT 
+            p.product_id, 
+            p.name AS product_name, 
+            pc.name AS category_name, 
+            SUM(oi.quantity) AS total_units_sold,
+            SUM(oi.total) AS total_revenue,
+            COUNT(DISTINCT o.order_id) AS order_count
+        FROM products p
+        JOIN product_categories pc ON p.category_id = pc.category_id
+        JOIN order_items oi ON p.product_id = oi.product_id
+        JOIN orders o ON oi.order_id = o.order_id
+        WHERE pc.category_id = %s
+        AND o.status NOT IN ('Cancelled', 'Returned')
+        {date_filter}
+        GROUP BY p.product_id, p.name, pc.name
+        ORDER BY {sort_by} {sort_order}
+        LIMIT %s
+    """
+    params = [categoryId]
+    filters = []
+    if startDate:
+        filters.append("o.order_date >= %s")
+        params.append(startDate)
+    if endDate:
+        filters.append("o.order_date <= %s")
+        params.append(endDate)
+
+    query = query.format(
+        date_filter="AND " + " AND ".join(filters) if filters else "",
+        sort_by=sortBy if sortBy in ["total_units_sold", "total_revenue", "order_count"] else "total_units_sold",
+        sort_order=sortOrder if sortOrder in ["ASC", "DESC"] else "DESC"
+    )
+    cursor.execute(query, params + [limit])
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"product_id": r["product_id"], "product_name": r["product_name"],
+             "category_name": r["category_name"], "total_units_sold": r["total_units_sold"],
+             "total_revenue": float(r["total_revenue"]), "order_count": r["order_count"]}
+            for r in results]
+
+
+@query.field("salesTrends")
+def resolve_sales_trends(_, info, startDate, endDate, interval="day"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    interval_map = {"day": "day", "week": "week", "month": "month"}
+    trunc_interval = interval_map.get(interval, "day")
+    query = f"""
+        SELECT 
+            DATE_TRUNC(%s, dt.date) AS date,
+            SUM(oi.total) AS total_sales
+        FROM dim_time dt
+        JOIN orders o ON DATE(o.order_date) = dt.date
+        JOIN order_items oi ON o.order_id = oi.order_id
+        WHERE dt.date BETWEEN %s AND %s
+        AND o.status NOT IN ('Cancelled', 'Returned')
+        GROUP BY DATE_TRUNC(%s, dt.date)
+        ORDER BY DATE_TRUNC(%s, dt.date)
+    """
+    cursor.execute(query, (trunc_interval, startDate, endDate, trunc_interval, trunc_interval))
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"date": r["date"].isoformat(), "total_sales": float(r["total_sales"])} for r in results]
+
+
+@mutation.field("updateProduct")
+def resolve_update_product(_, info, productId, name=None, price=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    updates = []
+    params = []
+    if name:
+        updates.append("name = %s")
+        params.append(name)
+    if price is not None:  # Allow price to be 0
+        updates.append("price = %s")
+        params.append(price)
+
+    if not updates:
+        cursor.close()
+        conn.close()
+        raise ValueError("No fields provided to update")
+
+    params.append(productId)
+    query = f"""
+        UPDATE products 
+        SET {', '.join(updates)}, updated_at = NOW()
+        WHERE product_id = %s
+        RETURNING product_id, name, price, category_id
+    """
+    cursor.execute(query, params)
+    result = cursor.fetchone()
+    conn.commit()
+
+    # Fetch category details
+    cursor.execute("SELECT category_id, name FROM product_categories WHERE category_id = %s", (result["category_id"],))
+    category = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if not result:
+        raise ValueError(f"Product with ID {productId} not found")
+
+    return {
+        "product_id": result["product_id"],
+        "name": result["name"],
+        "price": float(result["price"]),
+        "category": {"category_id": category["category_id"], "name": category["name"]}
+    }
+
+
+# Create executable schema
+schema = make_executable_schema(type_defs, [query, mutation])
+
+# FastAPI app with CORS
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://studio.apollographql.com", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+graphql_app = GraphQL(schema, debug=True)
+
+# Handle POST and GET requests to /graphql
+app.mount("/graphql", graphql_app)
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)-- PostgreSQL schema for e-commerce database with partitioning for large datasets
+
+-- Enable necessary extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- For text search
+
+-- Create custom types
+CREATE TYPE order_status AS ENUM (
+    'Pending', 'Processing', 'Shipped', 'In Transit', 'Delivered', 'Cancelled', 'Returned'
+);
+
+CREATE TYPE payment_method AS ENUM (
+    'Credit Card', 'PayPal', 'Apple Pay', 'Google Pay', 'Gift Card', 'Bank Transfer'
+);
+
+-- Create time dimension table for analytics
+CREATE TABLE dim_time (
+    time_id SERIAL PRIMARY KEY,
+    date DATE NOT NULL UNIQUE,
+    day_of_week SMALLINT NOT NULL,
+    day_of_month SMALLINT NOT NULL,
+    day_of_year SMALLINT NOT NULL,
+    week_of_year SMALLINT NOT NULL,
+    month SMALLINT NOT NULL,
+    month_name VARCHAR(9) NOT NULL,
+    quarter SMALLINT NOT NULL,
+    year SMALLINT NOT NULL,
+    is_weekend BOOLEAN NOT NULL,
+    is_holiday BOOLEAN NOT NULL
+);
+
+-- Create product categories table
+CREATE TABLE product_categories (
+    category_id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description TEXT,
+--     parent_id INTEGER REFERENCES product_categories(category_id),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Add index for hierarchical queries
+-- CREATE INDEX idx_product_categories_parent_id ON product_categories(parent_id);
+
+-- Create products table
+CREATE TABLE products (
+    product_id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price DECIMAL(10, 2) NOT NULL,
+    cost DECIMAL(10, 2),
+    category_id INTEGER NOT NULL REFERENCES product_categories(category_id),
+    sku VARCHAR(50) UNIQUE NOT NULL,
+    inventory_count INTEGER NOT NULL DEFAULT 0,
+    weight DECIMAL(8, 2),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Add indexes for products
+CREATE INDEX idx_products_category_id ON products(category_id);
+CREATE INDEX idx_products_is_active ON products(is_active);
+CREATE INDEX idx_products_name_trgm ON products USING gin (name gin_trgm_ops);
+
+-- Create customers table
+CREATE TABLE customers (
+    customer_id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    first_name VARCHAR(50) NOT NULL,
+    last_name VARCHAR(50) NOT NULL,
+    street_address VARCHAR(255),
+    city VARCHAR(100),
+    state VARCHAR(50),
+    zip_code VARCHAR(20),
+    country VARCHAR(50),
+    phone VARCHAR(50),
+    lifetime_value DECIMAL(12, 2) DEFAULT 0,
+    registration_date TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_login TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Add indexes for customers
+CREATE INDEX idx_customers_email ON customers(email);
+CREATE INDEX idx_customers_last_name ON customers(last_name);
+CREATE INDEX idx_customers_location ON customers(country, state, city);
+
+-- Create master orders table (partitioned by order_date)
+CREATE TABLE orders (
+    order_id SERIAL,
+    customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+    order_date TIMESTAMP NOT NULL,
+    status order_status NOT NULL DEFAULT 'Pending',
+    payment_method payment_method NOT NULL,
+    shipping_address VARCHAR(255) NOT NULL,
+    shipping_city VARCHAR(100) NOT NULL,
+    shipping_state VARCHAR(50) NOT NULL,
+    shipping_zip VARCHAR(20) NOT NULL,
+    shipping_country VARCHAR(50) NOT NULL,
+    processing_date TIMESTAMP,
+    shipping_date TIMESTAMP,
+    delivery_date TIMESTAMP,
+    total_amount DECIMAL(12, 2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (order_id, order_date)
+) PARTITION BY RANGE (order_date);
+
+-- Create partitions for orders (by year and month)
+CREATE TABLE orders_y2021 PARTITION OF orders FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
+CREATE TABLE orders_y2022 PARTITION OF orders FOR VALUES FROM ('2022-01-01') TO ('2023-01-01');
+CREATE TABLE orders_y2023 PARTITION OF orders FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE orders_y2024 PARTITION OF orders FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE orders_y2025 PARTITION OF orders FOR VALUES FROM ('2025-01-01') TO ('2025-04-01');
+
+-- Add indexes for orders
+CREATE INDEX idx_orders_customer_id ON orders(customer_id);
+CREATE INDEX idx_orders_order_date ON orders(order_date);
+CREATE INDEX idx_orders_status ON orders(status);
+
+-- Create order items table
+CREATE TABLE order_items (
+    order_item_id SERIAL PRIMARY KEY,
+    order_id INTEGER NOT NULL, -- No foreign key constraint for partitioned tables
+    product_id INTEGER NOT NULL REFERENCES products(product_id),
+    quantity INTEGER NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    discount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    total DECIMAL(10, 2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Add indexes for order items
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+
+-- Create daily sales aggregation table
+CREATE TABLE daily_sales_aggregation (
+    date DATE NOT NULL,
+    product_id INTEGER NOT NULL REFERENCES products(product_id),
+    category_id INTEGER NOT NULL REFERENCES product_categories(category_id),
+    units_sold INTEGER NOT NULL DEFAULT 0,
+    revenue DECIMAL(12, 2) NOT NULL DEFAULT 0,
+    order_count INTEGER NOT NULL DEFAULT 0,
+    avg_unit_price DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    PRIMARY KEY (date, product_id)
+);
+
+-- Create indexes on the daily sales aggregation table
+CREATE INDEX idx_daily_sales_date ON daily_sales_aggregation(date);
+CREATE INDEX idx_daily_sales_product_id ON daily_sales_aggregation(product_id);
+CREATE INDEX idx_daily_sales_category_id ON daily_sales_aggregation(category_id);
+
+-- Create materialized view for product sales summary (refreshed daily)
+CREATE MATERIALIZED VIEW product_sales_summary AS
+SELECT
+    p.product_id,
+    p.name AS product_name,
+    pc.name AS category_name,
+    SUM(oi.quantity) AS total_units_sold,
+    SUM(oi.total) AS total_revenue,
+    COUNT(DISTINCT o.order_id) AS order_count,
+    COUNT(DISTINCT o.customer_id) AS customer_count,
+    MAX(o.order_date) AS last_order_date
+FROM
+    products p
+    JOIN product_categories pc ON p.category_id = pc.category_id
+    JOIN order_items oi ON p.product_id = oi.product_id
+    JOIN orders o ON oi.order_id = o.order_id
+WHERE
+    o.status NOT IN ('Cancelled', 'Returned')
+GROUP BY
+    p.product_id, p.name, pc.name
+WITH NO DATA;
+
+-- Create index on the materialized view
+CREATE UNIQUE INDEX idx_product_sales_summary_product_id ON product_sales_summary(product_id);
+
+-- Create view for customer purchase history
+CREATE VIEW customer_purchase_summary AS
+SELECT
+    c.customer_id,
+    c.email,
+    c.first_name,
+    c.last_name,
+    COUNT(DISTINCT o.order_id) AS order_count,
+    SUM(o.total_amount) AS lifetime_value,
+    MIN(o.order_date) AS first_order_date,
+    MAX(o.order_date) AS last_order_date,
+    (MAX(o.order_date) - MIN(o.order_date)) / COUNT(DISTINCT o.order_id) AS avg_days_between_orders
+FROM
+    customers c
+    JOIN orders o ON c.customer_id = o.customer_id
+WHERE
+    o.status NOT IN ('Cancelled', 'Returned')
+GROUP BY
+    c.customer_id, c.email, c.first_name, c.last_name;
+
+-- Function to populate daily sales aggregation table
+CREATE OR REPLACE FUNCTION create_daily_sales_aggregation()
+RETURNS VOID AS $$
+BEGIN
+    -- Clear data for today (for idempotency)
+    DELETE FROM daily_sales_aggregation
+    WHERE date = CURRENT_DATE;
+
+    -- Insert today's aggregated data
+    INSERT INTO daily_sales_aggregation
+    SELECT
+        CAST(o.order_date AS DATE) AS date,
+        oi.product_id,
+        p.category_id,
+        SUM(oi.quantity) AS units_sold,
+        SUM(oi.total) AS revenue,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        SUM(oi.total) / SUM(oi.quantity) AS avg_unit_price
+    FROM
+        orders o
+        JOIN order_items oi ON o.order_id = oi.order_id
+        JOIN products p ON oi.product_id = p.product_id
+    WHERE
+        CAST(o.order_date AS DATE) = CURRENT_DATE
+        AND o.status NOT IN ('Cancelled', 'Returned')
+    GROUP BY
+        CAST(o.order_date AS DATE),
+        oi.product_id,
+        p.category_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger function to update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create triggers for updated_at
+CREATE TRIGGER update_product_categories_modtime
+    BEFORE UPDATE ON product_categories
+    FOR EACH ROW EXECUTE FUNCTION update_modified_column();
+
+CREATE TRIGGER update_products_modtime
+    BEFORE UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION update_modified_column();
+
+CREATE TRIGGER update_customers_modtime
+    BEFORE UPDATE ON customers
+    FOR EACH ROW EXECUTE FUNCTION update_modified_column();
+
+CREATE TRIGGER update_orders_modtime
+    BEFORE UPDATE ON orders
+    FOR EACH ROW EXECUTE FUNCTION update_modified_column();services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ecommerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./database-schema.sql:/docker-entrypoint-initdb.d/init.sql
+    # Uncomment if you want persistent data
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+#    uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - workflow
+    environment:
+      - DATABASE_HOST=postgres  # Matches service name for network resolution
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=ecommerce
+      - DATABASE_USER=admin
+      - DATABASE_PASSWORD=password
+    volumes:
+      - .:/app  # For development, maps local dir to container
+
+  workflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python workflow.py
+    depends_on:
+      - postgres
+    environment:
+      - DATABASE_HOST=postgres  # Matches service name for network resolution
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=ecommerce
+      - DATABASE_USER=admin
+      - DATABASE_PASSWORD=password
+    volumes:
+      - .:/app  # For development, maps local dir to container
+
+# Uncomment if you want persistent PostgreSQL data
+volumes:
+ postgres_data:FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV POETRY_VIRTUALENVS_CREATE=false
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl
+
+RUN curl -sSL https://install.python-poetry.org | python3 - \
+    && ln -s ~/.local/bin/poetry /usr/local/bin/poetry
+RUN poetry self add poetry-plugin-shell
+COPY pyproject.toml /app/
+COPY poetry.lock /app/
+RUN poetry lock && poetry install --no-interaction --no-ansi --no-root
+
+COPY . /app
+
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
+import logging
+import os
+import time
+import pytest
+from flytekit import task, workflow, Resources
+from typing import List, Optional, Dict
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# Database connection using environment variables
+def get_db_connection():
+    return psycopg2.connect(
+        dbname=os.getenv("DATABASE_NAME", "ecommerce"),
+        user=os.getenv("DATABASE_USER", "admin"),
+        password=os.getenv("DATABASE_PASSWORD", "password"),
+        host=os.getenv("DATABASE_HOST", "postgres"),
+        port=os.getenv("DATABASE_PORT", "5432")
+    )
+
+
+# Flyte task to extract data from CSV with chunking
+@task(requests=Resources(cpu="1", mem="1Gi"))
+def extract_csv(file_path: str, chunk_size: int = 10000) -> List[pd.DataFrame]:
+    logger.info(f"Extracting data from {file_path} in chunks of {chunk_size}")
+    chunks = []
+    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+        chunks.append(chunk)
+    return chunks
+
+
+# Flyte task to concatenate chunks into a single DataFrame
+@task(requests=Resources(cpu="1", mem="2Gi"))
+def concatenate_chunks(chunks: List[pd.DataFrame]) -> pd.DataFrame:
+    logger.info("Concatenating chunks into a single DataFrame")
+    return pd.concat(chunks)
+
+
+# Flyte task to transform data with business rules
+@task(requests=Resources(cpu="1", mem="2Gi"))
+def transform_data(df: pd.DataFrame, table_name: str, columns: List[str],
+                   products_df: Optional[pd.DataFrame] = None,
+                   orders_df: Optional[pd.DataFrame] = None) -> List[List[str]]:
+    logger.info(f"Transforming data for {table_name}")
+
+    # Specific business rules
+    if table_name == "products" and products_df is not None:
+        pass  # Join handled in DB schema
+
+    elif table_name == "order_items":
+        # Calculate revenue (price × quantity - discount)
+        df["price"] = df["price"].astype(float)
+        df["quantity"] = df["quantity"].astype(int)
+        df["discount"] = df["discount"].astype(float)
+        df["total"] = (df["price"] * df["quantity"]) - df["discount"]
+        df = df.dropna(subset=columns)
+
+    elif table_name == "customers" and orders_df is not None:
+        # Enrich with total lifetime value
+        orders_agg = orders_df.groupby("customer_id")["total_amount"].sum().reset_index()
+        orders_agg = orders_agg.rename(columns={"total_amount": "lifetime_value"})
+        df = df.merge(orders_agg, on="customer_id", how="left")
+        df["lifetime_value"] = df["lifetime_value"].fillna(0).astype(float)
+        df = df.dropna(subset=[col for col in columns if col != "lifetime_value"])  # Exclude lifetime_value from dropna
+
+    else:
+        # Common transformations for other tables
+        df = df.dropna(subset=columns)
+
+    # Type conversion after transformations
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].astype(float if pd.api.types.is_float_dtype(df[col]) else int)
+        df[col] = df[col].astype(str)
+
+    # Convert to list of lists
+    return [list(row) for row in df[columns].values]
+
+
+# Flyte task to aggregate daily sales
+@task(requests=Resources(cpu="1", mem="2Gi"))
+def aggregate_daily_sales(order_items_df: pd.DataFrame, products_df: pd.DataFrame, orders_df: pd.DataFrame) -> List[
+    List[str]]:
+    logger.info("Aggregating daily sales by product and category")
+
+    # Join order_items with orders to get order_date
+    order_items_with_date = order_items_df.merge(
+        orders_df[["order_id", "order_date"]],
+        on="order_id",
+        how="left"
+    )
+
+    # Convert order_date to datetime and extract date
+    order_items_with_date["order_date"] = pd.to_datetime(order_items_with_date["order_date"])
+    order_items_with_date["date"] = order_items_with_date["order_date"].dt.date.astype(str)
+    order_items_with_date["product_id"] = order_items_with_date["product_id"].astype(int)
+
+    # Join with products to get category_id
+    merged = order_items_with_date.merge(
+        products_df[["product_id", "category_id"]],
+        on="product_id",
+        how="left"
+    )
+
+    # Aggregate
+    daily_agg = merged.groupby(["date", "product_id", "category_id"]).agg(
+        units_sold=("quantity", "sum"),
+        revenue=("total", "sum"),
+        order_count=("order_id", "nunique")
+    ).reset_index()
+    daily_agg["avg_unit_price"] = (daily_agg["revenue"] / daily_agg["units_sold"]).fillna(0)
+
+    columns = ["date", "product_id", "category_id", "units_sold", "revenue", "order_count", "avg_unit_price"]
+    return [list(row) for row in daily_agg[columns].astype(str).values]
+
+
+# Flyte task to load data into database
+@task(requests=Resources(cpu="1", mem="1Gi"))
+def load_to_db(table_name: str, columns: List[str], data_rows: List[List[str]]) -> int:
+    logger.info(f"Loading data into {table_name}")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        query = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES %s ON CONFLICT DO NOTHING"
+        execute_values(cursor, query, data_rows)
+        conn.commit()
+        logger.info(f"Loaded {len(data_rows)} rows into {table_name}")
+        return len(data_rows)
+    except Exception as e:
+        logger.error(f"Load failed: {str(e)}")
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# Flyte task to refresh materialized view
+@task(requests=Resources(cpu="1", mem="1Gi"))
+def refresh_materialized_view(view_name: str, rows_loaded: int) -> bool:
+    logger.info(f"Refreshing materialized view {view_name} after loading {rows_loaded} rows")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"REFRESH MATERIALIZED VIEW {view_name}")
+        conn.commit()
+        logger.info(f"Materialized view {view_name} refreshed")
+        return True
+    except Exception as e:
+        logger.error(f"Refresh failed: {str(e)}")
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# Flyte workflow to orchestrate ETL
+@workflow
+def etl_workflow():
+    data_configs = [
+        {"file_path": "ecommerce_data/sample_product_categories.csv", "table_name": "product_categories",
+         "columns": ["category_id", "name", "description", "created_at"]},
+        {"file_path": "ecommerce_data/sample_products.csv", "table_name": "products",
+         "columns": ["product_id", "name", "description", "price", "cost", "category_id", "sku", "inventory_count",
+                     "weight", "created_at", "is_active"]},
+        {"file_path": "ecommerce_data/sample_customers.csv", "table_name": "customers",
+         "columns": ["customer_id", "email", "first_name", "last_name", "street_address", "city", "state", "zip_code",
+                     "country", "phone", "registration_date", "last_login", "lifetime_value"]},
+        {"file_path": "ecommerce_data/sample_orders.csv", "table_name": "orders",
+         "columns": ["order_id", "customer_id", "order_date", "status", "payment_method", "shipping_address",
+                     "shipping_city", "shipping_state", "shipping_zip", "shipping_country", "processing_date",
+                     "shipping_date", "delivery_date", "total_amount"]},
+        {"file_path": "ecommerce_data/sample_order_items.csv", "table_name": "order_items",
+         "columns": ["order_item_id", "order_id", "product_id", "quantity", "price", "discount", "total"]}
+    ]
+
+    # Extract all data
+    extracted_data = {config["table_name"]: extract_csv(file_path=config["file_path"]) for config in data_configs}
+
+    # Concatenate chunks
+    cat_df = concatenate_chunks(chunks=extracted_data["product_categories"])
+    prod_df = concatenate_chunks(chunks=extracted_data["products"])
+    cust_df = concatenate_chunks(chunks=extracted_data["customers"])
+    ord_df = concatenate_chunks(chunks=extracted_data["orders"])
+    oi_df = concatenate_chunks(chunks=extracted_data["order_items"])
+
+    # Transform and load product_categories
+    cat_transformed = transform_data(df=cat_df, table_name="product_categories", columns=data_configs[0]["columns"])
+    cat_rows_loaded = load_to_db(table_name="product_categories", columns=data_configs[0]["columns"],
+                                 data_rows=cat_transformed)
+
+    # Transform and load products (depends on product_categories)
+    prod_transformed = transform_data(df=prod_df, table_name="products", columns=data_configs[1]["columns"])
+    prod_rows_loaded = load_to_db(table_name="products", columns=data_configs[1]["columns"],
+                                  data_rows=prod_transformed)
+
+    # Transform and load customers (must be before orders due to FK)
+    cust_transformed = transform_data(df=cust_df, table_name="customers", columns=data_configs[2]["columns"],
+                                      orders_df=ord_df)
+    cust_rows_loaded = load_to_db(table_name="customers", columns=data_configs[2]["columns"],
+                                  data_rows=cust_transformed)
+
+    # Transform and load orders (depends on customers)
+    ord_transformed = transform_data(df=ord_df, table_name="orders", columns=data_configs[3]["columns"])
+    ord_rows_loaded = load_to_db(table_name="orders", columns=data_configs[3]["columns"],
+                                 data_rows=ord_transformed)
+
+    # Transform and load order_items (depends on orders and products)
+    oi_transformed = transform_data(df=oi_df, table_name="order_items", columns=data_configs[4]["columns"])
+    oi_rows_loaded = load_to_db(table_name="order_items", columns=data_configs[4]["columns"],
+                                data_rows=oi_transformed)
+
+    # Aggregate daily sales (depends on order_items, products, and orders)
+    daily_agg = aggregate_daily_sales(order_items_df=oi_df, products_df=prod_df, orders_df=ord_df)
+    daily_rows_loaded = load_to_db(table_name="daily_sales_aggregation",
+                                   columns=["date", "product_id", "category_id", "units_sold", "revenue", "order_count",
+                                            "avg_unit_price"],
+                                   data_rows=daily_agg)
+
+    # Refresh materialized view
+    refresh_success = refresh_materialized_view(view_name="product_sales_summary", rows_loaded=oi_rows_loaded)
+
+
+# Unit Tests
+@pytest.fixture
+def sample_df():
+    return pd.DataFrame({
+        "product_id": [1, 2], "name": ["A", "B"], "description": ["Desc A", "Desc B"],
+        "price": [10.0, 20.0], "cost": [5.0, 10.0], "category_id": [1, 2],
+        "sku": ["SKU1", "SKU2"], "inventory_count": [100, 200], "weight": [1.0, 2.0],
+        "created_at": ["2023-01-01", "2023-01-02"], "is_active": [True, True]
+    })
+
+
+def test_extract_csv(tmp_path):
+    file = tmp_path / "test.csv"
+    df = pd.DataFrame({"col1": [1, 2], "col2": ["a", "b"]})
+    df.to_csv(file, index=False)
+    result = extract_csv(file_path=str(file))
+    assert len(result) == 1
+    pd.testing.assert_frame_equal(result[0], df)
+
+
+def test_transform_data_products(sample_df):
+    columns = ["product_id", "name", "description", "price", "cost", "category_id", "sku",
+               "inventory_count", "weight", "created_at", "is_active"]
+    result = transform_data(df=sample_df, table_name="products", columns=columns)
+    expected = [list(row) for row in sample_df[columns].astype(str).values]
+    assert result == expected
+
+
+def test_transform_data_order_items():
+    df = pd.DataFrame({"order_item_id": [1], "order_id": [1], "product_id": [1],
+                       "quantity": [2], "price": [10.0], "discount": [1.0], "total": [0.0]})
+    columns = ["order_item_id", "order_id", "product_id", "quantity", "price", "discount", "total"]
+    result = transform_data(df=df, table_name="order_items", columns=columns)
+    expected = [["1", "1", "1", "2", "10.0", "1.0", "19.0"]]  # (10 * 2) - 1 = 19
+    assert result == expected
+
+
+def test_load_to_db(mocker):
+    mocker.patch("psycopg2.connect", return_value=mocker.Mock())
+    conn = psycopg2.connect()
+    cursor = conn.cursor.return_value
+    data_rows = [["1", "test"], ["2", "test2"]]
+    columns = ["id", "name"]
+    result = load_to_db(table_name="test_table", columns=columns, data_rows=data_rows)
+    assert result == 2
+    cursor.execute.assert_called_once()
+
+
+if __name__ == "__main__":
+    logger.info("Starting ETL workflow...")
+    etl_workflow()
+    logger.info("ETL workflow completed. Keeping container alive...")
+    while True:
+        time.sleep(60)
+        logger.info("Workflow service is still alive...")# Backend Engineer Take-Home Test: Data Processing & ETL Pipeline
+
+## Overview
+
+This take-home test evaluates your skills in designing and implementing a backend system that handles large-scale data processing, focusing on PostgreSQL, Python ETL, GraphQL API development, and workflow orchestration with Flyte.
+
+**Time Expectation:** 4-6 hours (you may take up to 3 days to submit)
+
+## Project Description
+
+You are tasked with building a data processing pipeline for an e-commerce analytics platform. The system needs to:
+
+1. Process large volumes of raw sales data (provided as CSV files)
+2. Transform and load the data into a PostgreSQL database
+3. Create a GraphQL API to query the processed data
+4. Orchestrate the ETL workflow using Flyte
+
+## Requirements
+
+### 1. Database Design (PostgreSQL)
+
+- Design a normalized schema for storing e-commerce sales data
+- Include tables for: products, customers, orders, order_items, and product_categories
+- Implement appropriate indexes for performance with large datasets
+- Write SQL migrations to create this schema
+- Design partitioning strategy for the orders table (assume millions of records)
+
+### 2. ETL Pipeline (Python)
+
+- Create a Python ETL pipeline that:
+  - Reads the provided CSV files
+  - Validates and cleans the data
+  - Transforms according to business rules (described below)
+  - Efficiently loads data into PostgreSQL using bulk operations
+- Implement error handling and logging
+- Use pandas or PySpark for data processing
+- Write unit tests for critical components
+
+### 3. GraphQL API
+
+- Implement a GraphQL API with the following queries:
+  - Get product sales by time period
+  - Get customer purchase history
+  - Get top-selling products by category
+  - Get sales trends over time
+- Include filtering, sorting, and pagination
+- Implement at least one mutation (e.g., update product information)
+- Consider query performance with large datasets
+
+### 4. Workflow Orchestration (Flyte)
+
+- Create a Flyte workflow that:
+  - Orchestrates the ETL pipeline
+  - Handles incremental data loads
+  - Includes data quality checks
+  - Provides monitoring and error handling
+- Document how this workflow would be scheduled and monitored in production
+
+## Data Transformation Rules
+
+The raw data needs the following transformations:
+
+1. Join product information with categories
+2. Calculate revenue per order (price × quantity - discount)
+3. Enrich customer data with derived attributes (e.g., total lifetime value)
+4. Aggregate daily sales data by product and category
+5. Generate dimension tables for time-based analysis
+
+## Dataset
+
+We provide the following CSV files (note: these are simulated datasets, approximately 1GB total):
+
+- `products.csv` (100k records)
+- `customers.csv` (1M records)
+- `orders.csv` (5M records)
+- `order_items.csv` (20M records)
+- `product_categories.csv` (500 records)
+
+Sample files with fewer records are provided for development purposes.
+
+## Deliverables
+
+Please provide:
+
+1. A GitHub repository containing:
+   - All code with documentation
+   - SQL migrations
+   - Docker Compose setup for local testing
+   - README with setup and execution instructions
+
+2. A brief technical document (max 2 pages) covering:
+   - Your approach to database design
+   - ETL pipeline architecture decisions
+   - Query optimization strategies 
+   - Scaling considerations
+   - Production deployment considerations
+
+3. A working demo with:
+   - ETL pipeline processing the sample data
+   - GraphQL endpoint with working queries
+   - Simple Flyte workflow definition
+
+## Evaluation Criteria
+
+You will be evaluated on:
+
+1. **Code quality and organization**
+   - Clean, readable, and maintainable code
+   - Proper error handling and testing
+   - Documentation quality
+
+2. **System design**
+   - Database schema design and optimization
+   - ETL pipeline efficiency and reliability
+   - API design and query performance
+   - Workflow orchestration approach
+
+3. **Performance considerations**
+   - Handling of large datasets
+   - Query optimization techniques
+   - Bulk loading strategies
+   - Resource utilization
+
+4. **Production readiness**
+   - Error handling and logging
+   - Deployment considerations
+   - Monitoring approach
+   - Incremental processing design
+
+## Technical Specifications
+
+- PostgreSQL 14+
+- Python 3.9+
+- GraphQL library of your choice (Apollo Server, Ariadne, etc.)
+- Flyte for workflow orchestration
+- Docker for containerization
+
+## Bonus Points
+
+- Implementation of a simple dashboard or visualization of the data
+- Advanced PostgreSQL features (partitioning, materialized views)
+- Performance benchmarks
+- CI/CD pipeline configuration
+- Comprehensive test coverage
+
+## Submission
+
+Please email a link to your GitHub repository to bob@vindecahealth.com and massy@vindecahealth.com along with your technical document.
+
+Good luck!

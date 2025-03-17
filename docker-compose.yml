@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ecommerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./database-schema.sql:/docker-entrypoint-initdb.d/init.sql
+    # Uncomment if you want persistent data
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+#    uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - workflow
+    environment:
+      - DATABASE_HOST=postgres  # Matches service name for network resolution
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=ecommerce
+      - DATABASE_USER=admin
+      - DATABASE_PASSWORD=password
+    volumes:
+      - .:/app  # For development, maps local dir to container
+
+  workflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python workflow.py
+    depends_on:
+      - postgres
+    environment:
+      - DATABASE_HOST=postgres  # Matches service name for network resolution
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=ecommerce
+      - DATABASE_USER=admin
+      - DATABASE_PASSWORD=password
+    volumes:
+      - .:/app  # For development, maps local dir to container
+
+# Uncomment if you want persistent PostgreSQL data
+volumes:
+ postgres_data:

@@ -1,0 +1,28 @@
+[project]
+name = "etl"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "chriscampbellt",email = "christopher.campbell.t@gmail.com"}
+]
+package-mode = false
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas (>=2.2.3,<3.0.0)",
+    "faker (>=37.0.0,<38.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "numpy (>=2.2.3,<3.0.0)",
+    "ariadne (>=0.26.1,<0.27.0)",
+    "psycopg2-binary (>=2.9.10,<3.0.0)",
+    "fastapi (>=0.115.11,<0.116.0)",
+    "uvicorn (>=0.34.0,<0.35.0)",
+    "flytekit (>=1.15.2,<2.0.0)",
+    "pyarrow (>=19.0.1,<20.0.0)",
+    "pytest (>=8.3.5,<9.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

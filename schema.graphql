@@ -1,0 +1,86 @@
+type Product {
+    product_id: Int!
+    name: String!
+    price: Float!
+    category: Category!
+}
+
+type Category {
+    category_id: Int!
+    name: String!
+}
+
+type Order {
+    order_id: Int!
+    customer_id: Int!
+    order_date: String!
+    total_amount: Float!
+}
+
+type Customer {
+    customer_id: Int!
+    email: String!
+    first_name: String!
+    last_name: String!
+    lifetime_value: Float!  # Added derived attribute
+}
+
+type SalesTrend {
+    date: String!
+    total_sales: Float!
+}
+
+type ProductSalesSummary {
+    product_id: Int!
+    product_name: String!
+    category_name: String!
+    total_units_sold: Int!
+    total_revenue: Float!
+    order_count: Int!
+}
+
+type Query {
+    productSales(
+        startDate: String!
+        endDate: String!
+        productId: Int
+        categoryId: Int
+        limit: Int = 10
+        offset: Int = 0
+        sortBy: String = "order_date"
+        sortOrder: String = "ASC"
+    ): [Order!]!
+
+    customerPurchaseHistory(
+        customerId: Int!
+        startDate: String
+        endDate: String
+        limit: Int = 10
+        offset: Int = 0
+        sortBy: String = "order_date"
+        sortOrder: String = "DESC"
+    ): [Order!]!
+
+    topSellingProductsByCategory(
+        categoryId: Int!
+        startDate: String
+        endDate: String
+        limit: Int = 10
+        sortBy: String = "total_units_sold"
+        sortOrder: String = "DESC"
+    ): [ProductSalesSummary!]!
+
+    salesTrends(
+        startDate: String!
+        endDate: String!
+        interval: String = "day"  # day, week, month
+    ): [SalesTrend!]!
+}
+
+type Mutation {
+    updateProduct(
+        productId: Int!
+        name: String
+        price: Float
+    ): Product!
+}
